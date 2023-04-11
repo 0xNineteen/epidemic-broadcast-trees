@@ -86,9 +86,10 @@ pub async fn msg_reciever(id: usize, mut reciever: Receiver<Message>, peers: Vec
     let mut msg_data = vec![];
 
     // track peers
+    let n_nodes = peers.len();
+
     // first eager
     let mut eager_peers = vec![];
-    let n_nodes = peers.len();
     let mut eager_ids = Vec::with_capacity(fanout_size);
     for _ in 0..fanout_size { 
         // sample without replacement 
@@ -105,20 +106,21 @@ pub async fn msg_reciever(id: usize, mut reciever: Receiver<Message>, peers: Vec
     }
 
     // then lazy the rest
-    let lazy_peers = peers
+    let mut lazy_peers = peers
         .iter()
         .filter(|(id, _)| !eager_ids.contains(id))
         .collect::<Vec<_>>();
 
-    let lazy_ids = lazy_peers.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    let mut lazy_ids = lazy_peers.iter().map(|(id, _)| *id).collect::<Vec<_>>();
 
     info!("NODE {id:?}: lazy {:?} eager {:?} total_n {:?}", lazy_ids, eager_ids, peers.len());
     assert!(lazy_peers.len() + eager_peers.len() == peers.len());
+    assert!(lazy_peers.len() == lazy_ids.len());
+    assert!(eager_peers.len() == eager_ids.len());
 
     // start
     while let Some(msg) = reciever.recv().await { 
         info!("NODE {id:?}: recieved: {msg:?}");
-
         match msg { 
             Message::ClientMessage(msg) => { 
                 let time = std::time::SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
@@ -147,22 +149,75 @@ pub async fn msg_reciever(id: usize, mut reciever: Receiver<Message>, peers: Vec
 
             }
             Message::EagerMessage(msg) => {
+                let is_eager_sender = eager_ids.contains(&msg.sender_id);
                 if !msg_ids.contains(&msg.msg_id) { 
-                
 
-                    // keep track 
+                    // track message
                     msg_ids.push(msg.msg_id);
                     msg_data.push(msg.data);
-                } else { 
 
+                    info!("NODE {id:?}: broadcasting...");
+                    let lazy_message = Message::LazyMessage(HeaderMessage { sender_id: id, msg_id: msg.msg_id});
+                    let eager_message = Message::EagerMessage(BodyMessage { data: msg.data, sender_id: id, msg_id: msg.msg_id });
+
+                    // exclude the sender which it was recieved from 
+                    broadcast_exclude(&eager_peers, eager_message, msg.sender_id).await?;
+                    broadcast_exclude(&lazy_peers, lazy_message, msg.sender_id).await?;
+
+                    if !is_eager_sender { 
+                        // move to eager
+                        let index = lazy_peers.iter().position(|(id, _)| *id == msg.sender_id).unwrap();
+                        let peer = lazy_peers.remove(index);
+                        let peer_id = lazy_ids.remove(index);
+                        eager_peers.push(peer);
+                        eager_ids.push(peer_id);
+
+                        info!("NODE {id:?}: moving {:?} to eager...", msg.sender_id);
+                        info!("NODE {id:?}: => lazy {:?} eager {:?}", lazy_ids, eager_ids);
+                    } 
+
+                } else if is_eager_sender { 
+                    // move to lazy
+                    let index = eager_peers.iter().position(|(id, _)| *id == msg.sender_id).unwrap();
+                    let peer = eager_peers.remove(index);
+                    let peer_id = eager_ids.remove(index);
+                    lazy_peers.push(peer);
+                    lazy_ids.push(peer_id);
+
+                    info!("NODE {id:?}: moving {:?} to lazy...", msg.sender_id);
+                    info!("NODE {id:?}: => lazy {:?} eager {:?}", lazy_ids, eager_ids);
+
+                    // send prune
+                    let message = Message::PruneMessage(IDMessage { sender_id: id });
+                    peer.1.send(message).await?;
                 }
-
             }
             Message::LazyMessage(msg) => {}
             Message::PullMessage(msg) => {}
-            Message::PruneMessage(msg) => {}
+            Message::PruneMessage(msg) => {
+                if eager_ids.contains(&msg.sender_id) { 
+                    // move to lazy
+                    let index = eager_peers.iter().position(|(id, _)| *id == msg.sender_id).unwrap();
+                    let peer = eager_peers.remove(index);
+                    let peer_id = eager_ids.remove(index);
+                    lazy_peers.push(peer);
+                    lazy_ids.push(peer_id);
+
+                    info!("NODE {id:?}: moving {:?} to lazy...", msg.sender_id);
+                    info!("NODE {id:?}: => lazy {:?} eager {:?}", lazy_ids, eager_ids);
+                }
+            }
         }
 
+    }
+    Ok(())
+}
+
+pub async fn broadcast_exclude(peers: &Vec<&Node>, msg: Message, exclude_id: usize) -> Result<()> { 
+    for (id, peer) in peers { 
+        if *id != exclude_id { 
+            peer.send(msg).await?; // todo: move await out of loop
+        }
     }
     Ok(())
 }
@@ -171,7 +226,6 @@ pub async fn broadcast(peers: &Vec<&Node>, msg: Message) -> Result<()> {
     for (_, peer) in peers { 
         peer.send(msg).await?; // todo: move await out of loop
     }
-
     Ok(())
 }
 
@@ -202,7 +256,7 @@ pub async fn main() {
     let client_sleep_time: u64 = 3;
 
     let mut step = 0;
-    loop { 
+    for _ in 0..1 { 
         let node_index: u64 = thread_rng().gen_range(0..n_nodes);
         let message = Message::ClientMessage(ClientMessage { data: step });
         let (_, sender) = &world_senders[node_index as usize];
