@@ -1,4 +1,4 @@
-use std::{time::{Duration, SystemTime}, collections::hash_map::DefaultHasher};
+use std::{time::{Duration, SystemTime}};
 
 use anyhow::Result;
 use sha2::Sha256;
@@ -233,7 +233,7 @@ pub async fn msg_reciever(id: usize, mut reciever: Receiver<Message>, peers: Vec
                 if let Some(index) = msg_ids.iter().position(|msg_id| *msg_id == msg.msg_id) { 
                     info!("NODE {id:?}: replying to pull request...",);
                     let data = msg_data[index];
-                    let message = Message::EagerMessage(BodyMessage { data: data, sender_id: id, msg_id: msg.msg_id });
+                    let message = Message::EagerMessage(BodyMessage { data, sender_id: id, msg_id: msg.msg_id });
                     let source_peer = eager_peers.iter().find(|(id, _)| *id == msg.sender_id).unwrap();
                     source_peer.1.send(message).await?;
                 } else { 
