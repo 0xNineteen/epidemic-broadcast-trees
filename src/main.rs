@@ -77,12 +77,6 @@ match message => {
 }
 */
 
-/*                    let index = lazy_peers.iter().position(|(id, _)| *id == msg.sender_id).unwrap();
-                    let peer = lazy_peers.remove(index);
-                    let peer_id = lazy_ids.remove(index);
-                    eager_peers.push(peer);
-                    eager_ids.push(peer_id); */
-
 macro_rules! swap {
     ($id:expr, $src:ident $srcid:ident => $dst:ident $dstid:ident) => {
         || -> &Node {
@@ -130,7 +124,6 @@ pub async fn msg_reciever(id: usize, mut reciever: Receiver<Message>, peers: Vec
         .iter()
         .filter(|(id, _)| !eager_ids.contains(id))
         .collect::<Vec<_>>();
-
     let mut lazy_ids = lazy_peers.iter().map(|(id, _)| *id).collect::<Vec<_>>();
 
     info!("NODE {id:?}: lazy {:?} eager {:?} total_n {:?}", lazy_ids, eager_ids, peers.len());
@@ -141,6 +134,7 @@ pub async fn msg_reciever(id: usize, mut reciever: Receiver<Message>, peers: Vec
     // start
     while let Some(msg) = reciever.recv().await { 
         info!("NODE {id:?}: recieved: {msg:?}");
+
         match msg { 
             Message::ClientMessage(msg) => { 
                 let time = std::time::SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
@@ -203,7 +197,7 @@ pub async fn msg_reciever(id: usize, mut reciever: Receiver<Message>, peers: Vec
                 }
             }
             Message::LazyMessage(msg) => {
-                // need to do this and allow new information to flow in 
+                // TODO: need to do this and allow new information to flow in 
                 let sleep_time = Duration::from_secs(1);
                 sleep(sleep_time).await;
 
@@ -224,11 +218,27 @@ pub async fn msg_reciever(id: usize, mut reciever: Receiver<Message>, peers: Vec
 
                 let sleep_time = Duration::from_secs(1);
                 sleep(sleep_time).await;
+
                 if msg_ids.contains(&msg.msg_id) { continue; } 
-                panic!("pull message failed abort!");
+                panic!("NODE {id:?}: pull message failed abort!");
             }
             Message::PullMessage(msg) => {
+                if !eager_ids.contains(&msg.sender_id) { 
+                    // add new link to eager
+                    swap!(msg.sender_id, lazy_peers lazy_ids => eager_peers eager_ids)();
+                    info!("NODE {id:?}: moving {:?} to eager...", msg.sender_id);
+                    info!("NODE {id:?}: => lazy {:?} eager {:?}", lazy_ids, eager_ids);
+                } 
 
+                if let Some(index) = msg_ids.iter().position(|msg_id| *msg_id == msg.msg_id) { 
+                    info!("NODE {id:?}: replying to pull request...",);
+                    let data = msg_data[index];
+                    let message = Message::EagerMessage(BodyMessage { data: data, sender_id: id, msg_id: msg.msg_id });
+                    let source_peer = eager_peers.iter().find(|(id, _)| *id == msg.sender_id).unwrap();
+                    source_peer.1.send(message).await?;
+                } else { 
+                    panic!("NODE {id:?}: pull request message not found - abort!");
+                }
             }
             Message::PruneMessage(msg) => {
                 if eager_ids.contains(&msg.sender_id) { 
@@ -250,6 +260,7 @@ pub async fn broadcast_exclude(peers: &Vec<&Node>, msg: Message, exclude_id: usi
             peer.send(msg).await?; // todo: move await out of loop
         }
     }
+
     Ok(())
 }
 
