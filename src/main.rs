@@ -76,6 +76,26 @@ match message => {
     }
 }
 */
+
+/*                    let index = lazy_peers.iter().position(|(id, _)| *id == msg.sender_id).unwrap();
+                    let peer = lazy_peers.remove(index);
+                    let peer_id = lazy_ids.remove(index);
+                    eager_peers.push(peer);
+                    eager_ids.push(peer_id); */
+
+macro_rules! swap {
+    ($id:expr, $src:ident $srcid:ident => $dst:ident $dstid:ident) => {
+        || -> &Node {
+            let index = $src.iter().position(|(id, _)| *id == $id).unwrap();
+            let peer = $src.remove(index);
+            let peer_id = $srcid.remove(index);
+            $dst.push(peer);
+            $dstid.push(peer_id);
+            peer
+        }
+    };
+}
+
 pub async fn msg_reciever(id: usize, mut reciever: Receiver<Message>, peers: Vec<Node>) -> Result<()> { 
     let fanout_size = 2;
 
@@ -166,24 +186,14 @@ pub async fn msg_reciever(id: usize, mut reciever: Receiver<Message>, peers: Vec
 
                     if !is_eager_sender { 
                         // move to eager
-                        let index = lazy_peers.iter().position(|(id, _)| *id == msg.sender_id).unwrap();
-                        let peer = lazy_peers.remove(index);
-                        let peer_id = lazy_ids.remove(index);
-                        eager_peers.push(peer);
-                        eager_ids.push(peer_id);
-
+                        swap!(msg.sender_id, lazy_peers lazy_ids => eager_peers eager_ids)();
                         info!("NODE {id:?}: moving {:?} to eager...", msg.sender_id);
                         info!("NODE {id:?}: => lazy {:?} eager {:?}", lazy_ids, eager_ids);
                     } 
 
                 } else if is_eager_sender { 
                     // move to lazy
-                    let index = eager_peers.iter().position(|(id, _)| *id == msg.sender_id).unwrap();
-                    let peer = eager_peers.remove(index);
-                    let peer_id = eager_ids.remove(index);
-                    lazy_peers.push(peer);
-                    lazy_ids.push(peer_id);
-
+                    let peer = swap!(msg.sender_id, eager_peers eager_ids => lazy_peers lazy_ids)();
                     info!("NODE {id:?}: moving {:?} to lazy...", msg.sender_id);
                     info!("NODE {id:?}: => lazy {:?} eager {:?}", lazy_ids, eager_ids);
 
@@ -192,17 +202,38 @@ pub async fn msg_reciever(id: usize, mut reciever: Receiver<Message>, peers: Vec
                     peer.1.send(message).await?;
                 }
             }
-            Message::LazyMessage(msg) => {}
-            Message::PullMessage(msg) => {}
+            Message::LazyMessage(msg) => {
+                // need to do this and allow new information to flow in 
+                let sleep_time = Duration::from_secs(1);
+                sleep(sleep_time).await;
+
+                // we have the info so the path is ok 
+                if msg_ids.contains(&msg.msg_id) { continue; } 
+
+                // need a new eager path bc we didnt get the data
+                let message = Message::PullMessage(HeaderMessage { sender_id: id, msg_id: msg.msg_id });
+                let (_, source_peer) = peers.iter().find(|(id, _)| *id == msg.sender_id).unwrap();
+                source_peer.send(message).await?;
+                
+                if !eager_ids.contains(&msg.sender_id) { 
+                    // add new link to eager
+                    swap!(msg.sender_id, lazy_peers lazy_ids => eager_peers eager_ids)();
+                    info!("NODE {id:?}: moving {:?} to eager...", msg.sender_id);
+                    info!("NODE {id:?}: => lazy {:?} eager {:?}", lazy_ids, eager_ids);
+                } 
+
+                let sleep_time = Duration::from_secs(1);
+                sleep(sleep_time).await;
+                if msg_ids.contains(&msg.msg_id) { continue; } 
+                panic!("pull message failed abort!");
+            }
+            Message::PullMessage(msg) => {
+
+            }
             Message::PruneMessage(msg) => {
                 if eager_ids.contains(&msg.sender_id) { 
                     // move to lazy
-                    let index = eager_peers.iter().position(|(id, _)| *id == msg.sender_id).unwrap();
-                    let peer = eager_peers.remove(index);
-                    let peer_id = eager_ids.remove(index);
-                    lazy_peers.push(peer);
-                    lazy_ids.push(peer_id);
-
+                    swap!(msg.sender_id, eager_peers eager_ids => lazy_peers lazy_ids)();
                     info!("NODE {id:?}: moving {:?} to lazy...", msg.sender_id);
                     info!("NODE {id:?}: => lazy {:?} eager {:?}", lazy_ids, eager_ids);
                 }
