@@ -12,6 +12,7 @@ path='src/main.rs'
 anyhow = "1.0.70"
 rand = "0.8.5"
 serde = { version = "1.0.160", features = ["derive"] }
+sha2 = "0.10.6"
 tokio = { version = "1.27.0", features = ["full"] }
 tracing = "0.1.37"
 tracing-subscriber = "0.3.16"
