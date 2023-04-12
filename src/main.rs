@@ -121,7 +121,7 @@ impl Node {
             eager_peers, 
             eager_ids, 
             lazy_peers, 
-            lazy_ids
+            lazy_ids, 
         }
     }
 
@@ -263,10 +263,14 @@ impl Node {
     pub async fn recieve(&mut self) -> anyhow::Result<()> { 
         let mut missing_messages: Vec<HeaderMessage> = vec![];
         let mut check_tick = interval(Duration::from_secs(1000)); // placeholder
+        let mut state_tick = interval(Duration::from_secs(3)); 
 
         // start
         loop { 
             tokio::select! {
+                _ = state_tick.tick() => { 
+                    info!("NODE {:?}: state = {:?}", self.id, self.msg_data.last());
+                }
                 _ = check_tick.tick() => { 
                     if let Some(mut msg) = missing_messages.pop() { 
                         if !self.msg_ids.contains(&msg.msg_id) { 
@@ -371,11 +375,11 @@ pub async fn main() {
     }
 
     // !! 
-    let client_sleep_time: u64 = 3;
+    let client_sleep_time: u64 = 2;
 
     // send some requests to broadcast
     let mut step = 0;
-    for _ in 0..1 { 
+    for _ in 0..10 { 
         let node_index: u64 = thread_rng().gen_range(0..n_nodes);
         let message = Message::ClientMessage(ClientMessage { data: step });
         let sender = &world_senders[node_index as usize].1;
