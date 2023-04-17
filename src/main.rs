@@ -124,7 +124,6 @@ impl Node {
     }
 
     pub fn move_to_lazy(&mut self, id: usize) -> Arc<Peer> { 
-        // move to lazy
         let peer = swap!(id, self.eager_peers, self.eager_ids => self.lazy_peers, self.lazy_ids)();
         info!("NODE {:?}: moving {:?} to lazy...", self.id, id);
         info!("NODE {:?}: => lazy {:?} eager {:?}", self.id, self.lazy_ids, self.eager_ids);
@@ -132,7 +131,6 @@ impl Node {
     }
 
     pub fn move_to_eager(&mut self, id: usize) -> Arc<Peer> { 
-        // move to lazy
         let peer = swap!(id, self.lazy_peers, self.lazy_ids => self.eager_peers, self.eager_ids)();
         info!("NODE {:?}: moving {:?} to eager...", self.id, id);
         info!("NODE {:?}: => lazy {:?} eager {:?}", self.id, self.lazy_ids, self.eager_ids);
