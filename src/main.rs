@@ -27,9 +27,8 @@ pub struct ClientMessage {
 
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone, Copy)]
 pub struct BodyMessage { 
+    pub header: HeaderMessage,
     pub data: u32, 
-    pub sender_id: usize,
-    pub msg_id: Sha256Bytes,
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone, Copy)]
@@ -42,7 +41,6 @@ pub struct HeaderMessage {
 pub struct IDMessage { 
     pub sender_id: usize,
 }
-
 
 macro_rules! swap {
     ($id:expr, $src:expr, $srcid:expr => $dst:expr, $dstid:expr) => {
@@ -141,62 +139,35 @@ impl Node {
         peer
     }
 
-    /* 
-    match message => {
-        EagerMessage(msg, sender_id, msg_id) => {  // full msg
-            if not recieved message_id { 
-                add sender to eager_peers
-            } else { 
-                move sender to lazy_peers 
-                send_prune(sender_id) 
-            }
-
-            eager_broadcast(msg)
-            lazy_broadcast(msg_id) // using a schedule policy to reduce network load
-        }, 
-        PullMessage(sender_id, msg_id) => {  // req for full msg 
-            move sender to eager_peers
-            if have msg_id: 
-                send(sender_id, msg, msg_id)
-        }, 
-        LazyMessage(sender_id, msg_id) => {  // just msg ID
-            while true { 
-                start timer for msg_id 
-                when timer done check if msg_id has been eagerly recieved
-                if not { 
-                    send_pull(sender_id, msg_id).await 
-                    sender_id = random(peers) // retry with another random peer
-                } else { break }
-            }
-        }, 
-        PruneMessage => { 
-            move sender to lazy_peers 
-        }
-    }
-    */
     pub async fn handle_eager_message(&mut self, msg: BodyMessage) -> Result<()> { 
-        let is_eager_sender = self.eager_ids.contains(&msg.sender_id);
-        if !self.msg_ids.contains(&msg.msg_id) { 
+        let BodyMessage { 
+            header: HeaderMessage { sender_id, msg_id }, 
+            data
+        } = msg;
+
+        let is_eager_sender = self.eager_ids.contains(&sender_id);
+        if !self.msg_ids.contains(&msg_id) { 
 
             // track message
-            self.msg_ids.push(msg.msg_id);
-            self.msg_data.push(msg.data);
+            self.msg_ids.push(msg_id);
+            self.msg_data.push(data);
 
             info!("NODE {:?}: broadcasting...", self.id);
-            let lazy_message = Message::LazyMessage(HeaderMessage { sender_id: self.id, msg_id: msg.msg_id});
-            let eager_message = Message::EagerMessage(BodyMessage { data: msg.data, sender_id: self.id, msg_id: msg.msg_id });
+            let header_msg = HeaderMessage { sender_id: self.id, msg_id}; 
+            let lazy_message = Message::LazyMessage(header_msg);
+            let eager_message = Message::EagerMessage(BodyMessage { data, header: header_msg});
 
             // exclude the sender which it was recieved from 
-            broadcast_exclude(&self.eager_peers, eager_message, msg.sender_id).await?;
-            broadcast_exclude(&self.lazy_peers, lazy_message, msg.sender_id).await?;
+            broadcast_exclude(&self.eager_peers, eager_message, sender_id).await?;
+            broadcast_exclude(&self.lazy_peers, lazy_message, sender_id).await?;
 
             if !is_eager_sender { 
                 // move to eager
-                self.move_to_eager(msg.sender_id);
+                self.move_to_eager(sender_id);
             } 
 
         } else if is_eager_sender { 
-            let peer = self.move_to_lazy(msg.sender_id);
+            let peer = self.move_to_lazy(sender_id);
             // send prune
             let message = Message::PruneMessage(IDMessage { sender_id: self.id });
             peer.1.send(message).await?;
@@ -210,11 +181,15 @@ impl Node {
             // add new link to eager
             self.move_to_eager(msg.sender_id);
         } 
+        let HeaderMessage { msg_id: req_msg_id, .. } = msg;
 
-        if let Some(index) = self.msg_ids.iter().position(|msg_id| *msg_id == msg.msg_id) { 
+        if let Some(index) = self.msg_ids.iter().position(|msg_id| *msg_id == req_msg_id) { 
             info!("NODE {:?}: replying to pull request...", self.id);
             let data = self.msg_data[index];
-            let message = Message::EagerMessage(BodyMessage { data, sender_id: self.id, msg_id: msg.msg_id });
+
+            // create the response
+            let header_msg = HeaderMessage { sender_id: self.id, msg_id: req_msg_id }; 
+            let message = Message::EagerMessage(BodyMessage { data, header: header_msg });
             let source_peer = self.eager_peers.iter().find(|peer| peer.0 == msg.sender_id).unwrap();
             source_peer.1.send(message).await?;
         } else { 
@@ -243,11 +218,12 @@ impl Node {
         self.msg_ids.push(msg_id);
         self.msg_data.push(msg.data);
 
+        let header_message = HeaderMessage { sender_id: self.id, msg_id }; 
         let eager_message = Message::EagerMessage(
-            BodyMessage { data: msg.data, sender_id: self.id, msg_id }
+            BodyMessage { data: msg.data, header: header_message }
         );
         let lazy_message = Message::LazyMessage(
-            HeaderMessage { sender_id: self.id, msg_id }
+            header_message
         );
 
         info!("NODE {:?}: broadcasting...", self.id);
@@ -310,7 +286,6 @@ impl Node {
                 resp = self.reciever.recv() => { 
                     if resp.is_none() { return Ok(()) }
                     let msg = resp.unwrap();
-
                     info!("NODE {:?}: recieved: {msg:?}", self.id);
 
                     match msg { 
@@ -350,6 +325,11 @@ pub async fn broadcast(peers: &Vec<Arc<Peer>>, msg: Message) -> Result<()> {
     Ok(())
 }
 
+// pub async fn setup_world(n_nodes: usize) -> (Vec<Node>, Vec<Peer>) {
+
+//     (world, world_senders)
+// }
+
 #[tokio::main(flavor="multi_thread", worker_threads=16)]
 pub async fn main() { 
     tracing_subscriber::fmt::init();
@@ -380,15 +360,25 @@ pub async fn main() {
     // send some requests to broadcast
     let mut step = 0;
     for _ in 0..10 { 
-        let node_index: u64 = thread_rng().gen_range(0..n_nodes);
+        let node_index: usize = thread_rng().gen_range(0..n_nodes);
         let message = Message::ClientMessage(ClientMessage { data: step });
-        let sender = &world_senders[node_index as usize].1;
+        let sender = &world_senders[node_index].1;
 
         info!("Client sending {step:?}...");
         sender.send(message).await.unwrap();
 
         step += 1;
         sleep(Duration::from_secs(client_sleep_time)).await;
+    }
+
+}
+
+mod tests { 
+    #[test]
+    pub fn test_convergence() -> anyhow::Result<()> { 
+         
+
+        Ok(())
     }
 
 }
