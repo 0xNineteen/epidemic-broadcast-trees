@@ -3,25 +3,26 @@ use std::{time::{Duration, SystemTime}, sync::Arc};
 use anyhow::Result;
 use sha2::Sha256;
 use sha2::Digest;
-use tokio::{sync::mpsc::{self, Sender, Receiver}, time::{sleep, interval}};
+use tokio::{sync::{mpsc::{self, Sender, Receiver}, RwLock}, time::{sleep, interval}};
 use tracing::info;
 use rand::{self, Rng, thread_rng};
 
 pub const HASH_BYTE_SIZE: usize = 4;
 pub type Sha256Bytes = [u8; HASH_BYTE_SIZE];
+pub const FANOUT_SIZE: usize = 2;
 pub type Peer = (usize, Sender<Message>);
 
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone, Copy)]
 pub enum Message { 
     ClientMessage(ClientMessage), 
     EagerMessage(BodyMessage), 
-    LazyMessage(HeaderMessage),
-    PullMessage(HeaderMessage), 
+    LazyMessage(HeaderMessage), // note: solana doesnt do this 
+    PullMessage(HeaderMessage),  // solana does this periodically with a bloom filter 
     PruneMessage(IDMessage),
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone, Copy)]
-pub struct ClientMessage { 
+pub struct ClientMessage {
     pub data: u32, 
 }
 
@@ -71,7 +72,6 @@ struct Node {
 impl Node { 
     pub fn new(id: usize, reciever: Receiver<Message>, peers: Vec<Arc<Peer>>) -> Self { 
         // ! 
-        let fanout_size = 2;
         let peer_ids = peers.iter().map(|peer| peer.0).collect::<Vec<_>>();
     
         // track peers
@@ -79,8 +79,8 @@ impl Node {
     
         // first eager (fanout size)
         let mut eager_peers = vec![];
-        let mut eager_ids = Vec::with_capacity(fanout_size);
-        for _ in 0..fanout_size { 
+        let mut eager_ids = Vec::with_capacity(FANOUT_SIZE);
+        for _ in 0..FANOUT_SIZE { 
             // sample without replacement 
             loop { 
                 let node_index: usize = thread_rng().gen_range(0..n_nodes);
@@ -324,7 +324,6 @@ pub async fn broadcast(peers: &Vec<Arc<Peer>>, msg: Message) -> Result<()> {
 }
 
 // pub async fn setup_world(n_nodes: usize) -> (Vec<Node>, Vec<Peer>) {
-
 //     (world, world_senders)
 // }
 
@@ -344,8 +343,10 @@ pub async fn main() {
         let mut peers = world_senders.clone();
         peers.remove(i);
 
+        let mut node = Arc::new(RwLock::new(Node::new(i, reciever, peers)));
+        
         let _handle = tokio::spawn(async move { 
-            let mut node = Node::new(i, reciever, peers);
+            let node = node.clone();
             node.recieve().await.unwrap();
         });
 
@@ -372,10 +373,9 @@ pub async fn main() {
 }
 
 mod tests { 
+
     #[test]
     pub fn test_convergence() -> anyhow::Result<()> { 
-         
-
         Ok(())
     }
 
