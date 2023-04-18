@@ -5,13 +5,19 @@ use serde::{Serialize, Deserialize};
 use sha2::Sha256;
 use sha2::Digest;
 use tokio::{sync::{mpsc::{self, Sender, Receiver}, RwLock}, time::{sleep, interval}};
-use tracing::info;
+use tracing::{info, debug};
 use rand::{self, Rng, thread_rng};
 
 pub const HASH_BYTE_SIZE: usize = 4;
 pub type Sha256Bytes = [u8; HASH_BYTE_SIZE];
 pub const FANOUT_SIZE: usize = 2;
 type Peer = (usize, Arc<ChannelSender<Message>>);
+
+macro_rules! node_log {
+    ($data:expr) => {
+        info!("NODE {:?}: {}...", std::thread::current().name(), $data);
+    };
+}
 
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone, Copy)]
 pub enum Message { 
@@ -107,7 +113,28 @@ impl Node {
     }
     
     pub fn handle_client_msg(&mut self, msg: ClientMessage) { 
+        let time = std::time::SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
+        let mut hasher = Sha256::new();
+        hasher.update(time.to_le_bytes());
+        hasher.update(msg.data.to_le_bytes());
+        let msg_id = hasher.finalize().as_slice()[..4].try_into().unwrap();
 
+        let header = HeaderMessage { sender_id: self.id, msg_id }; 
+        let msg = Message::EagerMessage(
+            BodyMessage { data: msg.data, header }
+        );
+
+        // broadcast msg to active set
+        for peer_id in &self.active_set { 
+            let sender = self.table.get(&peer_id).unwrap();
+            match sender.send(msg) { 
+                Err(e) => {
+                    // todo: track metrics
+                    node_log!(format!("msg send failed: {:?}", e));
+                }
+                _ => {}
+            }
+        }
     }
 
     pub fn handle_eager_msg(&mut self, msg: BodyMessage) { 
@@ -173,33 +200,40 @@ pub fn main() {
         .map(|(_, sender)| sender.clone())
         .collect::<Vec<_>>();
 
+    let mut handles = vec![];
     for (mut node, _) in nodes { 
-        let _ = node.add_peers(peers.clone());
+        node.add_peers(peers.clone());
+        let handle = std::thread::spawn(move || { 
+            node.reciever();
+        });
+        handles.push(handle);
     }
 
+    for handle in handles { 
+        let _ = handle.join();
+    }
 }
 
 #[cfg(test)]
 pub mod tests { 
     use super::*;
 
-    pub fn new_node() -> Node { 
+    pub fn new_node(id: usize) -> (Node, ChannelSender<Message>) { 
         let exit = Arc::new(AtomicBool::new(false));
-        let (_, reciever) = mpsc::channel::<Message>(100); 
-        let id = 0; 
+        let (sender, reciever) = mpsc::channel::<Message>(100); 
         let reciever = ChannelReciever(reciever);
+        let sender = ChannelSender(sender);
         let node = Node::new(id, reciever, exit);
-        node
+        (node, sender)
     }
 
     #[test]
     pub fn test_new_peer() { 
-        let mut node = new_node();
+        let (mut node, _) = new_node(0);
 
         let id = 2; 
         let (sender, _) = mpsc::channel::<Message>(100); 
         let peer = (id, Arc::new(ChannelSender(sender)));
-
         node.add_peers(vec![peer]); 
 
         assert_eq!(node.active_set.len(), 1); 
@@ -210,7 +244,7 @@ pub mod tests {
 
     #[test]
     pub fn test_exit() { 
-        let mut node = new_node();
+        let (mut node, _) = new_node(0);
 
         let exit = node.exit.clone();
         let handle = std::thread::spawn(move || { 
@@ -218,6 +252,43 @@ pub mod tests {
         });
         exit.store(true, Ordering::Relaxed);
 
+        let _ = handle.join();
+    }
+
+    #[test]
+    pub fn test_client_broadcast() { 
+        let (mut node, sender) = new_node(0);
+
+        // add a peer
+        let id = 2; 
+        let (peer_sender, mut reciever) = mpsc::channel::<Message>(100); 
+        let peer = (id, Arc::new(ChannelSender(peer_sender)));
+        node.add_peers(vec![peer]); 
+
+        let exit = node.exit.clone();
+        let handle = std::thread::spawn(move || { 
+            node.reciever();
+        });
+
+        // send a client msg
+        let msg_data = 0;
+        let msg = Message::ClientMessage(ClientMessage { data: msg_data });
+        sender.send(msg).unwrap();
+
+        // peer should recieve it 
+        thread::sleep(Duration::from_millis(10));
+        let msg = reciever.try_recv();
+        assert!(msg.is_ok());
+        let msg = msg.unwrap();
+
+        match msg {
+            Message::EagerMessage(msg) => { 
+                assert_eq!(msg.data, msg_data);
+            }
+            _ => assert!(false) 
+        }
+
+        exit.store(true, Ordering::Relaxed);
         let _ = handle.join();
     }
 
