@@ -4,9 +4,10 @@ use anyhow::{Result, anyhow};
 use serde::{Serialize, Deserialize};
 use sha2::Sha256;
 use sha2::Digest;
-use tokio::{sync::{mpsc::{self, Sender, Receiver}, RwLock}, time::{sleep, interval}};
+use tokio::{sync::{mpsc::{self, Sender, Receiver}}, time::{sleep, interval}};
 use tracing::{info, debug};
 use rand::{self, Rng, thread_rng};
+use std::sync::RwLock;
 
 pub const HASH_BYTE_SIZE: usize = 4;
 pub type Sha256Bytes = [u8; HASH_BYTE_SIZE];
@@ -74,39 +75,53 @@ impl<T> NetworkSender<T> for ChannelSender<T> {
     }
 }
 
+type PeerID = usize;
+
+pub struct GossipTable { 
+    pub active_set: Vec<PeerID>,
+    pub nodes: Vec<PeerID>, // indexs into the table Vec<node_id>
+    pub table: HashMap<PeerID, Arc<ChannelSender<Message>>>, // node => sender
+}
+
+impl Default for GossipTable { 
+    fn default() -> Self {
+        GossipTable { active_set: vec![], nodes: vec![], table: HashMap::default() }
+    }
+}
+
 pub struct Node { 
     pub id: usize,
     pub reciever: ChannelReciever<Message>,
-    pub active_set: Vec<usize>,
-    pub nodes: Vec<usize>, // indexs into the table Vec<node_id>
-    pub table: HashMap<usize, Arc<ChannelSender<Message>>>, // node => sender
-    pub exit: Arc<AtomicBool>
+    pub gossip: Arc<RwLock<GossipTable>>,
+    pub exit: Arc<AtomicBool>,
 }
 
 impl Node {
     pub fn new(id: usize, reciever: ChannelReciever<Message>, exit: Arc<AtomicBool>) -> Self { 
+        let gossip = GossipTable::default();
+        let gossip = Arc::new(RwLock::new(gossip));
+
         Node { 
             id, 
             reciever, 
-            active_set: vec![], 
-            nodes: vec![], 
-            table: HashMap::default(), 
+            gossip,
             exit,
         }
     }
 
     pub fn add_peers(&mut self, peers: Vec<Peer>) { 
-        let mut n_actives = FANOUT_SIZE - self.active_set.len();
+        let mut gossip = self.gossip.write().unwrap();
+        let mut n_actives = FANOUT_SIZE - gossip.active_set.len();
 
         for peer in peers { 
             let id = peer.0; 
             let sender = peer.1; 
 
-            self.nodes.push(id); 
-            self.table.insert(id, sender);
+            gossip.nodes.push(id); 
+            gossip.table.insert(id, sender);
 
             if n_actives != 0 { 
-                self.active_set.push(id);
+                gossip.active_set.push(id);
                 n_actives -= 1;
             }
         }
@@ -125,8 +140,9 @@ impl Node {
         );
 
         // broadcast msg to active set
-        for peer_id in &self.active_set { 
-            let sender = self.table.get(&peer_id).unwrap();
+        let gossip = self.gossip.read().unwrap();
+        for peer_id in &gossip.active_set { 
+            let sender = gossip.table.get(&peer_id).unwrap();
             match sender.send(msg) { 
                 Err(e) => {
                     // todo: track metrics
@@ -146,7 +162,13 @@ impl Node {
     }
 
     pub fn handle_prune_msg(&mut self, msg: IDMessage) { 
+        let sender_id = msg.sender_id;
 
+        // remove from active set
+        let mut gossip = self.gossip.write().unwrap();
+        if let Some(sender_idx) = gossip.active_set.iter().position(|id| *id == sender_id) { 
+            gossip.active_set.remove(sender_idx);
+        }
     }
 
     pub fn reciever(&mut self) { 
@@ -236,10 +258,12 @@ pub mod tests {
         let peer = (id, Arc::new(ChannelSender(sender)));
         node.add_peers(vec![peer]); 
 
-        assert_eq!(node.active_set.len(), 1); 
-        assert_eq!(node.nodes.len(), 1); 
-        assert_eq!(node.nodes[0], id); 
-        assert!(node.table.get(&id).is_some()); 
+        let gossip = node.gossip.read().unwrap();
+
+        assert_eq!(gossip.active_set.len(), 1); 
+        assert_eq!(gossip.nodes.len(), 1); 
+        assert_eq!(gossip.nodes[0], id); 
+        assert!(gossip.table.get(&id).is_some()); 
     }
 
     #[test]
@@ -253,6 +277,34 @@ pub mod tests {
         exit.store(true, Ordering::Relaxed);
 
         let _ = handle.join();
+    }
+
+    #[test]
+    pub fn test_prune_msg() { 
+        let (mut node, sender) = new_node(0);
+
+        // add a peer
+        let peer_id = 2; 
+        let (peer_sender, _) = mpsc::channel::<Message>(100); 
+        let peer = (peer_id, Arc::new(ChannelSender(peer_sender)));
+        node.add_peers(vec![peer]); 
+
+        let gossip = node.gossip.clone();
+
+        let exit = node.exit.clone();
+        let handle = std::thread::spawn(move || { 
+            node.reciever();
+        });
+
+        // send a client msg
+        let msg = Message::PruneMessage(IDMessage { sender_id: peer_id });
+        sender.send(msg).unwrap();
+
+        // should remove the peer from the active set
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(gossip.read().unwrap().active_set.len(), 0);
+        exit.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
     }
 
     #[test]
@@ -275,8 +327,8 @@ pub mod tests {
         let msg = Message::ClientMessage(ClientMessage { data: msg_data });
         sender.send(msg).unwrap();
 
-        // peer should recieve it 
-        thread::sleep(Duration::from_millis(10));
+        // peer should recieve it (as its in active set)
+        thread::sleep(Duration::from_millis(50));
         let msg = reciever.try_recv();
         assert!(msg.is_ok());
         let msg = msg.unwrap();
