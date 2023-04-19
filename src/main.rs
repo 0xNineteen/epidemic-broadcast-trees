@@ -76,16 +76,18 @@ impl<T> NetworkSender<T> for ChannelSender<T> {
 }
 
 type PeerID = usize;
+type DATA = u32;
 
 pub struct GossipTable { 
     pub active_set: Vec<PeerID>,
     pub nodes: Vec<PeerID>, // indexs into the table Vec<node_id>
-    pub table: HashMap<PeerID, Arc<ChannelSender<Message>>>, // node => sender
+    pub peer_table: HashMap<PeerID, Arc<ChannelSender<Message>>>, // node => sender
+    pub data_table: HashMap<Sha256Bytes, DATA>
 }
 
 impl Default for GossipTable { 
     fn default() -> Self {
-        GossipTable { active_set: vec![], nodes: vec![], table: HashMap::default() }
+        GossipTable { active_set: vec![], nodes: vec![], peer_table: HashMap::default(), data_table: HashMap::default() }
     }
 }
 
@@ -94,6 +96,15 @@ pub struct Node {
     pub reciever: ChannelReciever<Message>,
     pub gossip: Arc<RwLock<GossipTable>>,
     pub exit: Arc<AtomicBool>,
+}
+
+pub fn get_msg_id(data: DATA) -> Sha256Bytes { 
+    let time = std::time::SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
+    let mut hasher = Sha256::new();
+    hasher.update(time.to_le_bytes());
+    hasher.update(data.to_le_bytes());
+    let msg_id = hasher.finalize().as_slice()[..4].try_into().unwrap();
+    msg_id
 }
 
 impl Node {
@@ -118,7 +129,7 @@ impl Node {
             let sender = peer.1; 
 
             gossip.nodes.push(id); 
-            gossip.table.insert(id, sender);
+            gossip.peer_table.insert(id, sender);
 
             if n_actives != 0 { 
                 gossip.active_set.push(id);
@@ -128,22 +139,34 @@ impl Node {
     }
     
     pub fn handle_client_msg(&mut self, msg: ClientMessage) { 
-        let time = std::time::SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos();
-        let mut hasher = Sha256::new();
-        hasher.update(time.to_le_bytes());
-        hasher.update(msg.data.to_le_bytes());
-        let msg_id = hasher.finalize().as_slice()[..4].try_into().unwrap();
-
+        let msg_id = get_msg_id(msg.data);
         let header = HeaderMessage { sender_id: self.id, msg_id }; 
-        let msg = Message::EagerMessage(
-            BodyMessage { data: msg.data, header }
-        );
+        let body = BodyMessage { data: msg.data, header };
+
+        // record in current data 
+        { 
+            let mut gossip = self.gossip.write().unwrap(); 
+            gossip.data_table.insert(msg_id, msg.data);
+        }
 
         // broadcast msg to active set
+        let msg = Message::EagerMessage(body);
+        self.broadcast_to_active(msg, None);
+    }
+
+    pub fn broadcast_to_active(&self, msg: Message, exclude: Option<usize>) { 
         let gossip = self.gossip.read().unwrap();
-        for peer_id in &gossip.active_set { 
-            let sender = gossip.table.get(&peer_id).unwrap();
-            match sender.send(msg) { 
+        let mut active_set = gossip.active_set.clone();
+        if let Some(exclude_id) = exclude { 
+            if let Some(exclude_index) = active_set.iter().position(|id| *id == exclude_id) { 
+                active_set.remove(exclude_index);
+            }
+        }
+        let peers = active_set.iter().map(|id| gossip.peer_table.get(&id).unwrap());
+
+        node_log!("broadcasting...");
+        for peer in peers { 
+            match peer.send(msg) { 
                 Err(e) => {
                     // todo: track metrics
                     node_log!(format!("msg send failed: {:?}", e));
@@ -154,7 +177,47 @@ impl Node {
     }
 
     pub fn handle_eager_msg(&mut self, msg: BodyMessage) { 
+        let BodyMessage { 
+            header: HeaderMessage { sender_id, msg_id }, 
+            data
+        } = msg;
 
+        let gossip = self.gossip.read().unwrap();
+        let is_old_data = gossip.data_table.contains_key(&msg_id);
+
+        if is_old_data { 
+            // find peer
+            let peer_index = gossip.active_set.iter().position(|id| *id == sender_id);
+            let peer_is_active_set = peer_index.is_some();
+
+            // send prune
+            if let Some(peer) = gossip.peer_table.get(&sender_id) { 
+                let msg = Message::PruneMessage(IDMessage { sender_id: self.id });
+                let _ = peer.send(msg);
+                drop(gossip);
+
+                if peer_is_active_set { 
+                    // remove from active set 
+                    let peer_index = peer_index.unwrap();
+                    let mut gossip = self.gossip.write().unwrap();
+                    gossip.active_set.remove(peer_index);
+                }
+            }
+
+        } else { 
+            drop(gossip);
+
+            // record new data
+            { 
+                let mut gossip = self.gossip.write().unwrap();
+                gossip.data_table.insert(msg_id, data);
+            }
+
+            // send to active nodes
+            let header_msg = HeaderMessage { sender_id: self.id, msg_id}; 
+            let msg = Message::EagerMessage(BodyMessage { data, header: header_msg});
+            self.broadcast_to_active(msg, Some(sender_id));
+        }
     }
 
     pub fn handle_pull_msg(&mut self, msg: HeaderMessage) { 
@@ -263,7 +326,7 @@ pub mod tests {
         assert_eq!(gossip.active_set.len(), 1); 
         assert_eq!(gossip.nodes.len(), 1); 
         assert_eq!(gossip.nodes[0], id); 
-        assert!(gossip.table.get(&id).is_some()); 
+        assert!(gossip.peer_table.get(&id).is_some()); 
     }
 
     #[test]
@@ -328,14 +391,78 @@ pub mod tests {
         sender.send(msg).unwrap();
 
         // peer should recieve it (as its in active set)
-        thread::sleep(Duration::from_millis(50));
-        let msg = reciever.try_recv();
-        assert!(msg.is_ok());
+        let msg = reciever.blocking_recv();
+        assert!(msg.is_some());
         let msg = msg.unwrap();
 
         match msg {
             Message::EagerMessage(msg) => { 
                 assert_eq!(msg.data, msg_data);
+            }
+            _ => assert!(false) 
+        }
+
+        exit.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+    }
+
+    #[test]
+    pub fn test_eager_broadcast() { 
+        let (mut node, sender) = new_node(0);
+
+        // add a peer
+        let id = 2; 
+        let (peer_sender, mut reciever) = mpsc::channel::<Message>(100); 
+        let peer = (id, Arc::new(ChannelSender(peer_sender)));
+        node.add_peers(vec![peer]); 
+
+        // clone nodes gossip
+        let gossip = node.gossip.clone();
+
+        let exit = node.exit.clone();
+        let handle = std::thread::spawn(move || { 
+            node.reciever();
+        });
+
+        // send a eager msg
+        let msg_data = 0;
+        let msg_id = get_msg_id(msg_data);
+        let header = HeaderMessage { sender_id: 4, msg_id };  // from another peer
+        let body = BodyMessage { data: msg_data, header };
+        let msg = Message::EagerMessage(body);
+        sender.send(msg).unwrap();
+
+        // peer should recieve it (as its in active set)
+        let msg = reciever.blocking_recv();
+        assert!(msg.is_some());
+        let msg = msg.unwrap();
+
+        match msg {
+            Message::EagerMessage(msg) => { 
+                assert_eq!(msg.data, msg_data);
+            }
+            _ => assert!(false) 
+        }
+
+        // data should be in its data table now 
+        let _gossip = gossip.read().unwrap();
+        let data_table = _gossip.data_table.get(&msg_id);
+        assert!(data_table.is_some());
+        drop(_gossip);
+
+        // send another eager message (is old data now)
+        let header = HeaderMessage { sender_id: 2, msg_id }; 
+        let body = BodyMessage { data: msg_data, header };
+        let msg = Message::EagerMessage(body);
+        sender.send(msg).unwrap();
+
+        // should get a prune message
+        let msg = reciever.blocking_recv();
+        assert!(msg.is_some());
+        let msg = msg.unwrap();
+        match msg {
+            Message::PruneMessage(msg) => { 
+                assert_eq!(msg.sender_id, 0);
             }
             _ => assert!(false) 
         }
